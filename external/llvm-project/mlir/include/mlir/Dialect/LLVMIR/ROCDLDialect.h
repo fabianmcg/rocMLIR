@@ -37,4 +37,12 @@
 
 #include "mlir/Dialect/LLVMIR/ROCDLOpsDialect.h.inc"
 
+namespace mlir {
+namespace ROCDL {
+/// Returns the key used for storing the ROCDL metadata dictionary in the
+/// property field dictionary in `#gpu.object`.
+StringRef getROCDLObjectMetadataName();
+} // namespace ROCDL
+} // namespace mlir
+
 #endif /* MLIR_DIALECT_LLVMIR_ROCDLDIALECT_H_ */

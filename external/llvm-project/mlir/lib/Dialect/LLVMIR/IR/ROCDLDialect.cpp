@@ -295,6 +295,35 @@ ROCDLTargetAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// ROCDL object metadata
+//===----------------------------------------------------------------------===//
+
+StringRef mlir::ROCDL::getROCDLObjectMetadataName() { return "rocdl.metadata"; }
+
+ROCDLKernelAttr
+ROCDLKernelAttr::appendMetadata(ArrayRef<NamedAttribute> attrs) const {
+  if (attrs.empty())
+    return *this;
+  NamedAttrList attrList(attrs);
+  attrList.append(getMetadata());
+  return ROCDLKernelAttr::get(getFuncAttrs(),
+                              attrList.getDictionary(getContext()));
+}
+
+LogicalResult
+ROCDLObjectMDAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                          DictionaryAttr dict) {
+  if (!dict)
+    return emitError() << "table cannot be null";
+  if (llvm::any_of(dict, [](NamedAttribute attr) {
+        return !llvm::isa<ROCDLKernelAttr>(attr.getValue());
+      }))
+    return emitError()
+           << "all the dictionary values must be `#rocdl.kernel` attributes";
+  return success();
+}
+
 #define GET_OP_CLASSES
 #include "mlir/Dialect/LLVMIR/ROCDLOps.cpp.inc"
 

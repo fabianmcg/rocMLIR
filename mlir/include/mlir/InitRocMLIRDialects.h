@@ -58,6 +58,10 @@
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/InitMHALDialects.h"
+#include "mlir/Target/LLVM/ROCDL/Target.h"
+#include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 
 namespace mlir {
 
@@ -109,6 +113,12 @@ inline void registerUpstreamDialects(DialectRegistry &registry) {
   tensor::registerInferTypeOpInterfaceExternalModels(registry);
   tensor::registerTilingInterfaceExternalModels(registry);
   vector::registerBufferizableOpInterfaceExternalModels(registry);
+  ROCDL::registerROCDLTargetInterfaceExternalModels(registry);
+
+  // Register translations required by `gpu-module-to-binary`.
+  registerLLVMDialectTranslation(registry);
+  registerROCDLDialectTranslation(registry);
+  registerGPUDialectTranslation(registry);
 }
 
 // Add all the MLIR dialects to the provided registry.

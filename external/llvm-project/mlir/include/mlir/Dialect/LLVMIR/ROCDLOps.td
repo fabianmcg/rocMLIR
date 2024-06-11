@@ -805,4 +805,164 @@ def ROCDL_TargettAttr :
     }
   }];
 }
+
+//===----------------------------------------------------------------------===//
+// ROCDL kernel attribute
+//===----------------------------------------------------------------------===//
+
+def ROCDL_KernelAttr :
+    ROCDL_Attr<"ROCDLKernel", "kernel"> {
+  let description = [{
+    ROCDL attribute for storing metadata related to a compiled kernel. It
+    contains the attribute dictionary of the LLVM function used to generate the
+    kernel, as well as an optional dictionary for additional metadata, like ELF
+    related metadata.
+    For details on the ELF metadata see:
+    https://llvm.org/docs/AMDGPUUsage.html#code-object-v5-metadata
+
+    Examples:
+    ```mlir
+      #rocdl.kernel<{sym_name = "test_fusion__part_0", ...},
+                    metadata = {sgpr_count = 255, ...}>
+    ```
+  }];
+  let parameters = (ins
+    "DictionaryAttr":$func_attrs,
+    OptionalParameter<"DictionaryAttr", "metadata dictionary">:$metadata
+  );
+  let assemblyFormat = [{
+    `<` $func_attrs (`,` `metadata` `=` $metadata^ )? `>`
+  }];
+  let builders = [
+    AttrBuilderWithInferredContext<(ins "DictionaryAttr":$funcAttrs,
+                                         CArg<"DictionaryAttr",
+                                              "nullptr">:$metadata), [{
+      assert(funcAttrs && "invalid function attributes dictionary");
+      return $_get(funcAttrs.getContext(), funcAttrs, metadata);
+    }]>
+  ];
+  let extraClassDeclaration = [{
+    /// Returns the function attribute corresponding to key or nullptr if missing.
+    Attribute getAttr(StringRef key) const {
+      return getFuncAttrs().get(key);
+    }
+    template <typename ConcreteAttr>
+    ConcreteAttr getAttr(StringRef key) const {
+      return llvm::dyn_cast_or_null<ConcreteAttr>(getAttr(key));
+    }
+    Attribute getAttr(StringAttr key) const;
+    template <typename ConcreteAttr>
+    ConcreteAttr getAttr(StringAttr key) const {
+      return llvm::dyn_cast_or_null<ConcreteAttr>(getAttr(key));
+    }
+
+    /// Returns the name of the kernel.
+    StringAttr getName() const {
+      return getAttr<StringAttr>("sym_name");
+    }
+
+    /// Returns the metadta attribute corresponding to key or nullptr if missing.
+    Attribute getMDAttr(StringRef key) const {
+      if (DictionaryAttr attrs = getMetadata())
+        return attrs.get(key);
+      return nullptr;
+    }
+    template <typename ConcreteAttr>
+    ConcreteAttr getMDAttr(StringRef key) const {
+      return llvm::dyn_cast_or_null<ConcreteAttr>(getMDAttr(key));
+    }
+    Attribute getMDAttr(StringAttr key) const;
+    template <typename ConcreteAttr>
+    ConcreteAttr getMDAttr(StringAttr key) const {
+      return llvm::dyn_cast_or_null<ConcreteAttr>(getMDAttr(key));
+    }
+
+    /// Returns the number of required scalar registers, or nullptr if the field
+    /// is missing.
+    IntegerAttr getSGPR() const {
+      return getMDAttr<IntegerAttr>("sgpr_count");
+    }
+
+    /// Returns the number of required scalar registers, or nullptr if the field
+    /// is missing.
+    IntegerAttr getVGPR() const {
+      return getMDAttr<IntegerAttr>("vgpr_count");
+    }
+
+    /// Returns the number of required scalar registers, or nullptr if the field
+    /// is missing.
+    IntegerAttr getAGPR() const {
+      return getMDAttr<IntegerAttr>("agpr_count");
+    }
+
+    /// Returns the number of spilled SGPR, or nullptr if the field is missing.
+    IntegerAttr getSGPRSpill() const {
+      return getMDAttr<IntegerAttr>("sgpr_spill_count");
+    }
+
+    /// Returns the number of spilled VGPR, or nullptr if the field is missing.
+    IntegerAttr getVGPRSpill() const {
+      return getMDAttr<IntegerAttr>("vgpr_spill_count");
+    }
+
+    /// Helper function for appending metadata to a kernel attribute.
+    ROCDLKernelAttr appendMetadata(ArrayRef<NamedAttribute> attrs) const;
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// ROCDL object metadata
+//===----------------------------------------------------------------------===//
+
+def ROCDL_ObjectMDAttr :
+    ROCDL_Attr<"ROCDLObjectMD", "object_metadata"> {
+  let description = [{
+    ROCDL attribute representing a table of kernels metadata. All the attributes
+    in the dictionary must be of type `#rocdl.kernel`.
+
+    Examples:
+    ```mlir
+      #rocdl.object_metadata<{kernel0 = #rocdl.kernel<...>}>
+    ```
+  }];
+  let parameters = (ins
+    "DictionaryAttr":$kernel_table
+  );
+  let assemblyFormat = [{
+    `<` $kernel_table `>`
+  }];
+  let builders = [
+    AttrBuilderWithInferredContext<(ins "DictionaryAttr":$kernel_table), [{
+      assert(kernel_table && "invalid kernel table");
+      return $_get(kernel_table.getContext(), kernel_table);
+    }]>
+  ];
+  let skipDefaultBuilders = 1;
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    /// Helper iterator class for traversing the kernel table.
+    struct KernelIterator
+        : llvm::mapped_iterator_base<KernelIterator,
+                                    llvm::ArrayRef<NamedAttribute>::iterator,
+                                    std::pair<StringAttr, ROCDLKernelAttr>> {
+      using llvm::mapped_iterator_base<
+          KernelIterator, llvm::ArrayRef<NamedAttribute>::iterator,
+          std::pair<StringAttr, ROCDLKernelAttr>>::mapped_iterator_base;
+      /// Map the iterator to the kernel name and a KernelAttribute.
+      std::pair<StringAttr, ROCDLKernelAttr> mapElement(NamedAttribute attr) const {
+        return {attr.getName(), llvm::cast<ROCDLKernelAttr>(attr.getValue())};
+      }
+    };
+    auto begin() const {
+      return KernelIterator(getKernelTable().begin());
+    }
+    auto end() const {
+      return KernelIterator(getKernelTable().end());
+    }
+    size_t size() const {
+      return getKernelTable().size();
+    }
+  }];
+}
+
 #endif // ROCDLIR_OPS

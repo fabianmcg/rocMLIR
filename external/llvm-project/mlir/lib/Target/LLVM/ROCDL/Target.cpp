@@ -17,12 +17,13 @@
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVM/ROCDL/Utils.h"
-#include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 
+#include "lld/Common/CommonLinkerContext.h"
+#include "lld/Common/Driver.h"
+
 #include "llvm/IR/Constants.h"
+#include "llvm/IRReader/IRReader.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCCodeEmitter.h"
@@ -35,16 +36,20 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/Mutex.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Program.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/TargetParser.h"
 
 #include <cstdlib>
 #include <optional>
+
+LLD_HAS_DRIVER(elf)
 
 using namespace mlir;
 using namespace mlir::ROCDL;
@@ -62,11 +67,15 @@ public:
   serializeToObject(Attribute attribute, Operation *module,
                     const gpu::TargetOptions &options) const;
 
-  Attribute createObject(Attribute attribute,
+  Attribute createObject(Attribute attribute, Operation *module,
                          const SmallVector<char, 0> &object,
                          const gpu::TargetOptions &options) const;
 };
 } // namespace
+
+#ifdef ROCMLIR_DEVICE_LIBS_PACKAGED
+#include "ROCDL/AmdDeviceLibs.cpp.inc"
+#endif
 
 // Register the ROCDL dialect, the ROCDL translation and the target interface.
 void mlir::ROCDL::registerROCDLTargetInterfaceExternalModels(
@@ -111,9 +120,6 @@ SerializeGPUModuleBase::SerializeGPUModuleBase(
     for (Attribute attr : files.getValue())
       if (auto file = dyn_cast<StringAttr>(attr))
         fileList.push_back(file.str());
-
-  // Append standard ROCm device bitcode libraries to the files to be loaded.
-  (void)appendStandardLibs();
 }
 
 void SerializeGPUModuleBase::init() {
@@ -138,29 +144,100 @@ ArrayRef<std::string> SerializeGPUModuleBase::getFileList() const {
   return fileList;
 }
 
-LogicalResult SerializeGPUModuleBase::appendStandardLibs() {
+LogicalResult
+SerializeGPUModuleBase::appendStandardLibs(AMDGCNLibraryList libs) {
+  if (libs.isEmpty())
+    return success();
   StringRef pathRef = getToolkitPath();
-  if (!pathRef.empty()) {
-    SmallVector<char, 256> path;
-    path.insert(path.begin(), pathRef.begin(), pathRef.end());
-    llvm::sys::path::append(path, "amdgcn", "bitcode");
-    pathRef = StringRef(path.data(), path.size());
-    if (!llvm::sys::fs::is_directory(pathRef)) {
-      getOperation().emitRemark() << "ROCm amdgcn bitcode path: " << pathRef
-                                  << " does not exist or is not a directory.";
-      return failure();
-    }
-    StringRef isaVersion =
-        llvm::AMDGPU::getArchNameAMDGCN(llvm::AMDGPU::parseArchAMDGCN(chip));
-    isaVersion.consume_front("gfx");
-    return getCommonBitcodeLibs(fileList, path, isaVersion);
+  // Fail if the toolkit is empty.
+  if (pathRef.empty())
+    return failure();
+
+  // Get the path for the device libraries
+  SmallString<256> libDir;
+  libDir.insert(libDir.begin(), pathRef.begin(), pathRef.end());
+  llvm::sys::path::append(libDir, "amdgcn", "bitcode");
+  pathRef = StringRef(libDir.data(), libDir.size());
+
+  // Fail if the libDir is invalid.
+  if (!llvm::sys::fs::is_directory(pathRef)) {
+    getOperation().emitRemark() << "ROCm amdgcn bitcode libDir: " << pathRef
+                                << " does not exist or is not a directory.";
+    return failure();
   }
+
+  // Get the ISA version.
+  StringRef isaVersion =
+      llvm::AMDGPU::getArchNameAMDGCN(llvm::AMDGPU::parseArchAMDGCN(chip));
+  isaVersion.consume_front("gfx");
+
+  // Helper function for adding a library.
+  auto addLib = [&](const Twine &lib) -> bool {
+    auto baseSize = libDir.size();
+    llvm::sys::path::append(libDir, lib);
+    StringRef path(libDir.data(), libDir.size());
+    if (!llvm::sys::fs::is_regular_file(path)) {
+      getOperation().emitRemark() << "Bitcode library path: " << path
+                                  << " does not exist or is not a file.\n";
+      return true;
+    }
+    fileList.push_back(path.str());
+    libDir.truncate(baseSize);
+    return false;
+  };
+
+  // Add ROCm device libraries. Fail if any of the libraries is not found, ie.
+  // if any of the `addLib` failed.
+  if ((libs.requiresLibrary(AMDGCNLibraryList::Ocml) && addLib("ocml.bc")) ||
+      (libs.requiresLibrary(AMDGCNLibraryList::Ockl) && addLib("ockl.bc")) ||
+      (libs.requiresLibrary(AMDGCNLibraryList::Hip) && addLib("hip.bc")) ||
+      (libs.requiresLibrary(AMDGCNLibraryList::OpenCL) &&
+       addLib("opencl.bc")) ||
+      (libs.containLibraries(AMDGCNLibraryList::Ocml |
+                             AMDGCNLibraryList::Ockl) &&
+       addLib("oclc_isa_version_" + isaVersion + ".bc")))
+    return failure();
   return success();
 }
 
 std::optional<SmallVector<std::unique_ptr<llvm::Module>>>
 SerializeGPUModuleBase::loadBitcodeFiles(llvm::Module &module) {
   SmallVector<std::unique_ptr<llvm::Module>> bcFiles;
+  // Return if there are no libs to load.
+  if (deviceLibs.isEmpty() && fileList.empty())
+    return bcFiles;
+  SmallVector<std::pair<StringRef, AMDGCNLibraryList::Library>, 3> libraries;
+  AMDGCNLibraryList libs = deviceLibs;
+  if (deviceLibs.requiresLibrary(AMDGCNLibraryList::Ocml))
+    libraries.push_back({"ocml.bc", AMDGCNLibraryList::Ocml});
+  if (deviceLibs.requiresLibrary(AMDGCNLibraryList::Ockl))
+    libraries.push_back({"ockl.bc", AMDGCNLibraryList::Ockl});
+  if (deviceLibs.requiresLibrary(AMDGCNLibraryList::OpenCL))
+    libraries.push_back({"opencl.bc", AMDGCNLibraryList::OpenCL});
+  if (deviceLibs.requiresLibrary(AMDGCNLibraryList::Hip))
+    libraries.push_back({"hib.bc", AMDGCNLibraryList::Hip});
+#ifdef ROCMLIR_DEVICE_LIBS_PACKAGED
+  const llvm::StringMap<StringRef> &packagedLibs = getDeviceLibraries();
+  for (auto [file, lib] : libraries) {
+    llvm::SMDiagnostic error;
+    std::unique_ptr<llvm::Module> library;
+    if (packagedLibs.contains(file)) {
+      std::unique_ptr<llvm::MemoryBuffer> fileBc =
+          llvm::MemoryBuffer::getMemBuffer(packagedLibs.at(file), file);
+      library =
+          llvm::getLazyIRModule(std::move(fileBc), error, module.getContext());
+      // Unset the lib so we don't add it with `appendStandardLibs`.
+      libs.removeLibrary(lib);
+      bcFiles.push_back(std::move(library));
+    } else {
+      getOperation().emitWarning("Trying to find " + Twine(file) +
+                                 " at runtime since it wasn't packaged");
+    }
+  }
+#endif
+  // Try to append any remaining standard device libs.
+  if (failed(appendStandardLibs(libs)))
+    return std::nullopt;
   if (failed(loadBitcodeFilesFromList(module.getContext(), fileList, bcFiles,
                                       true)))
     return std::nullopt;
@@ -174,80 +251,75 @@ LogicalResult SerializeGPUModuleBase::handleBitcodeFile(llvm::Module &module) {
   // Stop spamming us with clang version numbers
   if (auto *ident = module.getNamedMetadata("llvm.ident"))
     module.eraseNamedMetadata(ident);
+  // Override the libModules datalayout and target triple with the compiler's
+  // data layout should there be a discrepency.
+  setDataLayoutAndTriple(module);
   return success();
 }
 
 void SerializeGPUModuleBase::handleModulePreLink(llvm::Module &module) {
-  [[maybe_unused]] std::optional<llvm::TargetMachine *> targetMachine =
+  std::optional<llvm::TargetMachine *> targetMachine =
       getOrCreateTargetMachine();
   assert(targetMachine && "expect a TargetMachine");
-  addControlVariables(module, target.hasWave64(), target.hasDaz(),
+  for (llvm::Function &f : module.functions()) {
+    if (f.hasExternalLinkage() && f.hasName() && !f.hasExactDefinition()) {
+      StringRef funcName = f.getName();
+      if ("printf" == funcName)
+        deviceLibs.addList(AMDGCNLibraryList::getOpenCL());
+      if (funcName.starts_with("__ockl_"))
+        deviceLibs.addLibrary(AMDGCNLibraryList::Ockl);
+      if (funcName.starts_with("__ocml_"))
+        deviceLibs.addLibrary(AMDGCNLibraryList::Ocml);
+    }
+  }
+  addControlVariables(module, deviceLibs, target.hasWave64(), target.hasDaz(),
                       target.hasFiniteOnly(), target.hasUnsafeMath(),
                       target.hasFastMath(), target.hasCorrectSqrt(),
                       target.getAbi());
 }
 
-// Get the paths of ROCm device libraries.
-LogicalResult SerializeGPUModuleBase::getCommonBitcodeLibs(
-    llvm::SmallVector<std::string> &libs, SmallVector<char, 256> &libPath,
-    StringRef isaVersion) {
-  auto addLib = [&](StringRef path) -> bool {
-    if (!llvm::sys::fs::is_regular_file(path)) {
-      getOperation().emitRemark() << "Bitcode library path: " << path
-                                  << " does not exist or is not a file.\n";
-      return true;
-    }
-    libs.push_back(path.str());
-    return false;
-  };
-  auto getLibPath = [&libPath](Twine lib) {
-    auto baseSize = libPath.size();
-    llvm::sys::path::append(libPath, lib + ".bc");
-    std::string path(StringRef(libPath.data(), libPath.size()).str());
-    libPath.truncate(baseSize);
-    return path;
-  };
-
-  // Add ROCm device libraries. Fail if any of the libraries is not found.
-  if (addLib(getLibPath("ocml")) || addLib(getLibPath("ockl")) ||
-      addLib(getLibPath("hip")) || addLib(getLibPath("opencl")) ||
-      addLib(getLibPath("oclc_isa_version_" + isaVersion)))
-    return failure();
-  return success();
-}
-
 void SerializeGPUModuleBase::addControlVariables(
-    llvm::Module &module, bool wave64, bool daz, bool finiteOnly,
-    bool unsafeMath, bool fastMath, bool correctSqrt, StringRef abiVer) {
-  llvm::Type *i8Ty = llvm::Type::getInt8Ty(module.getContext());
-  auto addControlVariable = [i8Ty, &module](StringRef name, bool enable) {
+    llvm::Module &module, AMDGCNLibraryList libs, bool wave64, bool daz,
+    bool finiteOnly, bool unsafeMath, bool fastMath, bool correctSqrt,
+    StringRef abiVer) {
+  // Return if no device libraries are required.
+  if (libs.isEmpty())
+    return;
+  // Helper function for adding control variables.
+  auto addControlVariable = [&module](StringRef name, uint32_t value,
+                                      uint32_t bitwidth) {
+    if (module.getNamedGlobal(name)) {
+      return;
+    }
+    llvm::IntegerType *type =
+        llvm::IntegerType::getIntNTy(module.getContext(), bitwidth);
     llvm::GlobalVariable *controlVariable = new llvm::GlobalVariable(
-        module, i8Ty, true, llvm::GlobalValue::LinkageTypes::LinkOnceODRLinkage,
-        llvm::ConstantInt::get(i8Ty, enable), name, nullptr,
-        llvm::GlobalValue::ThreadLocalMode::NotThreadLocal, 4);
+        module, /*isConstant=*/type, true,
+        llvm::GlobalValue::LinkageTypes::LinkOnceODRLinkage,
+        llvm::ConstantInt::get(type, value), name, /*before=*/nullptr,
+        /*threadLocalMode=*/llvm::GlobalValue::ThreadLocalMode::NotThreadLocal,
+        /*addressSpace=*/4);
     controlVariable->setVisibility(
         llvm::GlobalValue::VisibilityTypes::ProtectedVisibility);
-    controlVariable->setAlignment(llvm::MaybeAlign(1));
+    controlVariable->setAlignment(llvm::MaybeAlign(bitwidth / 8));
     controlVariable->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Local);
   };
-  addControlVariable("__oclc_finite_only_opt", finiteOnly || fastMath);
-  addControlVariable("__oclc_unsafe_math_opt", unsafeMath || fastMath);
-  addControlVariable("__oclc_daz_opt", daz || fastMath);
-  addControlVariable("__oclc_correctly_rounded_sqrt32",
-                     correctSqrt && !fastMath);
-  addControlVariable("__oclc_wavefrontsize64", wave64);
-
-  llvm::Type *i32Ty = llvm::Type::getInt32Ty(module.getContext());
-  int abi = 500;
-  abiVer.getAsInteger(0, abi);
-  llvm::GlobalVariable *abiVersion = new llvm::GlobalVariable(
-      module, i32Ty, true, llvm::GlobalValue::LinkageTypes::LinkOnceODRLinkage,
-      llvm::ConstantInt::get(i32Ty, abi), "__oclc_ABI_version", nullptr,
-      llvm::GlobalValue::ThreadLocalMode::NotThreadLocal, 4);
-  abiVersion->setVisibility(
-      llvm::GlobalValue::VisibilityTypes::ProtectedVisibility);
-  abiVersion->setAlignment(llvm::MaybeAlign(4));
-  abiVersion->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Local);
+  // Add ocml related control variables.
+  if (libs.requiresLibrary(AMDGCNLibraryList::Ocml)) {
+    addControlVariable("__oclc_finite_only_opt", finiteOnly || fastMath, 8);
+    addControlVariable("__oclc_daz_opt", daz || fastMath, 8);
+    addControlVariable("__oclc_correctly_rounded_sqrt32",
+                       correctSqrt && !fastMath, 8);
+    addControlVariable("__oclc_unsafe_math_opt", unsafeMath || fastMath, 8);
+  }
+  // Add ocml or ockl related control variables.
+  if (libs.containLibraries(AMDGCNLibraryList::Ocml |
+                            AMDGCNLibraryList::Ockl)) {
+    addControlVariable("__oclc_wavefrontsize64", wave64, 8);
+    int abi = 500;
+    abiVer.getAsInteger(0, abi);
+    addControlVariable("__oclc_ABI_version", abi, 32);
+  }
 }
 
 std::optional<SmallVector<char, 0>>
@@ -313,7 +385,6 @@ SerializeGPUModuleBase::assembleIsa(StringRef isa) {
 
   parser->setTargetParser(*tap);
   parser->Run(false);
-
   return result;
 }
 
@@ -384,14 +455,17 @@ AMDGPUSerializer::compileToBinary(const std::string &serializedISA) {
   }
   llvm::FileRemover cleanupHsaco(tempHsacoFilename);
 
-  llvm::SmallString<128> lldPath(toolkitPath);
-  llvm::sys::path::append(lldPath, "llvm", "bin", "ld.lld");
-  int lldResult = llvm::sys::ExecuteAndWait(
-      lldPath,
-      {"ld.lld", "-shared", tempIsaBinaryFilename, "-o", tempHsacoFilename});
-  if (lldResult != 0) {
-    getOperation().emitError() << "lld invocation failed.";
-    return std::nullopt;
+  static llvm::sys::Mutex mutex;
+  {
+    const llvm::sys::ScopedLock lock(mutex);
+    // Invoke lld. Expect a true return value from lld.
+    if (!lld::elf::link({"ld.lld", "-shared", tempIsaBinaryFilename.c_str(),
+                         "-o", tempHsacoFilename.c_str()},
+                        llvm::outs(), llvm::errs(), false, false)) {
+      getOperation().emitError() << "lld invocation error";
+      return std::nullopt;
+    }
+    lld::CommonLinkerContext::destroy();
   }
 
   // Load the HSA code object.
@@ -474,14 +548,35 @@ std::optional<SmallVector<char, 0>> ROCDLTargetAttrImpl::serializeToObject(
 }
 
 Attribute
-ROCDLTargetAttrImpl::createObject(Attribute attribute,
+ROCDLTargetAttrImpl::createObject(Attribute attribute, Operation *module,
                                   const SmallVector<char, 0> &object,
                                   const gpu::TargetOptions &options) const {
-  gpu::CompilationTarget format = options.getCompilationTarget();
   Builder builder(attribute.getContext());
+  gpu::CompilationTarget format = options.getCompilationTarget();
+  // If format is `fatbin` transform it to binary.
+  if (format > gpu::CompilationTarget::Binary)
+    format = gpu::CompilationTarget::Binary;
+
+  DictionaryAttr properties{};
+  // Only add properties if the format is an ELF binary.
+  if (gpu::CompilationTarget::Binary == format) {
+    NamedAttrList props;
+    // Collect kernel metadata
+    ROCDLObjectMDAttr metadata = getAMDHSAKernelsMetadata(module, object);
+    props.append(getROCDLObjectMetadataName(), metadata);
+
+    // TODO(fmora): MHAL appears to be storing prefill attributes in the module,
+    // switch them to be function attributes as they are present in
+    // `ROCDLObjectMDAttr`.
+    for (auto [key, kernel] : metadata) {
+      if (auto attr = module->getDiscardableAttr(key))
+        props.append(key, attr);
+    }
+    properties = builder.getDictionaryAttr(props);
+  }
+
   return builder.getAttr<gpu::ObjectAttr>(
-      attribute,
-      format > gpu::CompilationTarget::Binary ? gpu::CompilationTarget::Binary
-                                              : format,
-      builder.getStringAttr(StringRef(object.data(), object.size())), nullptr);
+      attribute, format,
+      builder.getStringAttr(StringRef(object.data(), object.size())),
+      properties);
 }
