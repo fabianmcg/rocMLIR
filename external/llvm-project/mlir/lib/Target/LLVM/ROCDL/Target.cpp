@@ -524,5 +524,5 @@ ROCDLTargetAttrImpl::createObject(Attribute attribute,
   return builder.getAttr<gpu::ObjectAttr>(
       attribute, format,
       builder.getStringAttr(StringRef(object.data(), object.size())),
-      properties);
+      properties, nullptr);
 }
