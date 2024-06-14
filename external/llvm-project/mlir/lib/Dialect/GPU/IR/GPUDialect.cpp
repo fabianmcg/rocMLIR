@@ -1082,11 +1082,13 @@ BlockArgument LaunchOp::addPrivateAttribution(Type type, Location loc) {
 //===----------------------------------------------------------------------===//
 
 void LaunchFuncOp::build(OpBuilder &builder, OperationState &result,
-                         GPUFuncOp kernelFunc, KernelDim3 gridSize,
+                         SymbolRefAttr kernelSymbol, KernelDim3 gridSize,
                          KernelDim3 getBlockSize, Value dynamicSharedMemorySize,
                          ValueRange kernelOperands, Type asyncTokenType,
                          ValueRange asyncDependencies,
                          std::optional<KernelDim3> clusterSize) {
+  assert(kernelSymbol.getNestedReferences().size() == 1 &&
+         "expected a symbol reference with a single nested reference");
   result.addOperands(asyncDependencies);
   if (asyncTokenType)
     result.types.push_back(builder.getType<AsyncTokenType>());
@@ -1099,10 +1101,6 @@ void LaunchFuncOp::build(OpBuilder &builder, OperationState &result,
   if (dynamicSharedMemorySize)
     result.addOperands(dynamicSharedMemorySize);
   result.addOperands(kernelOperands);
-  auto kernelModule = kernelFunc->getParentOfType<GPUModuleOp>();
-  auto kernelSymbol =
-      SymbolRefAttr::get(kernelModule.getNameAttr(),
-                         {SymbolRefAttr::get(kernelFunc.getNameAttr())});
 
   Properties &prop = result.getOrAddProperties<Properties>();
   prop.kernel = kernelSymbol;
@@ -1121,6 +1119,21 @@ void LaunchFuncOp::build(OpBuilder &builder, OperationState &result,
   prop.operandSegmentSizes[segmentSizesLen - 2] =
       static_cast<int32_t>(kernelOperands.size());
   prop.operandSegmentSizes[segmentSizesLen - 1] = 0;
+}
+
+void LaunchFuncOp::build(OpBuilder &builder, OperationState &result,
+                         GPUFuncOp kernelFunc, KernelDim3 gridSize,
+                         KernelDim3 getBlockSize, Value dynamicSharedMemorySize,
+                         ValueRange kernelOperands, Type asyncTokenType,
+                         ValueRange asyncDependencies,
+                         std::optional<KernelDim3> clusterSize) {
+  auto kernelModule = kernelFunc->getParentOfType<GPUModuleOp>();
+  auto kernelSymbol =
+      SymbolRefAttr::get(kernelModule.getNameAttr(),
+                         {SymbolRefAttr::get(kernelFunc.getNameAttr())});
+  build(builder, result, kernelSymbol, gridSize, getBlockSize,
+        dynamicSharedMemorySize, kernelOperands, asyncTokenType,
+        asyncDependencies, clusterSize);
 }
 
 void LaunchFuncOp::build(OpBuilder &builder, OperationState &result,
