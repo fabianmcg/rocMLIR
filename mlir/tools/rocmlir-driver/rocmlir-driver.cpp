@@ -23,6 +23,7 @@
 #include "mlir/IR/AsmState.h"
 #include "mlir/InitRocMLIRDialects.h"
 #include "mlir/InitRocMLIRPasses.h"
+#include "mlir/InitRocMLIRTarget.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -425,6 +426,7 @@ static LogicalResult runMLIRPasses(ModuleOp &module,
 int main(int argc, char **argv) {
   DialectRegistry registry;
   registerRocMLIRDialects(registry);
+  registerRocTarget(registry);
   MLIRContext context(registry);
   context.loadDialect<mhal::MHALDialect, rock::RockDialect, func::FuncDialect,
                       scf::SCFDialect, affine::AffineDialect,
