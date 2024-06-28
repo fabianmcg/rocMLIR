@@ -51,6 +51,10 @@ MLIR_CAPI_EXPORTED void mlirGetKernelInfo(MlirModule module, int *size,
 // Returns block_size and grid_size as uint32_t[2]
 MLIR_CAPI_EXPORTED void mlirGetKernelAttrs(MlirModule module, uint32_t *attrs);
 
+// Returns block_size, grid_size and lds_size as uint32_t[7]
+MLIR_CAPI_EXPORTED void mlirGetKernelAttrsExt(MlirModule module,
+                                              uint32_t *attrs, char **symName);
+
 // Returns the size of compiled binary if called with null ptr
 // and return the compiled binary when buffer is provided
 MLIR_CAPI_EXPORTED bool mlirGetBinary(MlirModule module, size_t *size,
@@ -62,6 +66,8 @@ MLIR_CAPI_EXPORTED bool mlirGetBinary(MlirModule module, size_t *size,
 /// Architecture and num_cu information should be set on the kernel function
 /// being compiled.
 MLIR_CAPI_EXPORTED void mlirMIGraphXAddHighLevelPipeline(MlirPassManager pm);
+MLIR_CAPI_EXPORTED void
+mlirMIGraphXAddHighLevelPipelineWithArch(MlirPassManager pm, const char *arch);
 
 /// Adds the pipeline that checks if the kernel with a given tuning
 /// configuration will actually compile to the pass manager. If this pipeline
