@@ -231,5 +231,6 @@ MLIRRockTransforms
 MLIRRockTuning
 MLIRRockUtility
 MLIRTosaToRock
+MLIRROCMLIRTarget
 RocmlirEmulateFp8ExtTrunc
 )
